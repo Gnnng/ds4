@@ -27,9 +27,19 @@ class JpegDecodeTests(unittest.TestCase):
         cls.addClassCleanup(cls.temp.cleanup)
         root = Path(__file__).resolve().parents[1]
         lib = Path(cls.temp.name) / "image.so"
+        pkg_config = shlex.split(os.environ.get("PKG_CONFIG", "pkg-config"))
+        webp_cflags = os.environ.get("WEBP_CFLAGS")
+        if webp_cflags is None:
+            webp_cflags = subprocess.check_output(
+                pkg_config + ["--cflags", "libwebp"], text=True)
+        webp_libs = os.environ.get("WEBP_LIBS")
+        if webp_libs is None:
+            webp_libs = subprocess.check_output(
+                pkg_config + ["--libs", "libwebp"], text=True)
         subprocess.run(shlex.split(os.environ.get("CC", "cc")) +
+                       shlex.split(webp_cflags) +
                        ["-shared", "-fPIC", "-O2", str(root / "ds4_image.c"),
-                        "-lm", "-o", str(lib)], check=True)
+                        "-lm", "-o", str(lib)] + shlex.split(webp_libs), check=True)
         cls.lib = ctypes.CDLL(str(lib))
         cls.lib.ds4_image_decode_memory.argtypes = [ctypes.POINTER(DecodedImage),
             ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t]

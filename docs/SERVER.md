@@ -24,6 +24,7 @@ relative runtime files such as Metal kernels can be found.
 | Endpoint | Use |
 | --- | --- |
 | `GET /v1/models` | Loaded model information |
+| `GET /v1/models/{id}` | Metadata for one model or compatibility alias |
 | `POST /v1/chat/completions` | OpenAI-style chat |
 | `POST /v1/responses` | Responses-style requests and continuations |
 | `POST /v1/completions` | Text completions |
@@ -31,6 +32,12 @@ relative runtime files such as Metal kernels can be found.
 
 The Flash and PRO names accepted by the model endpoints are compatibility
 aliases, not separate loaded models. The GGUF passed at startup selects the model.
+
+Both model endpoints report `input_modalities: ["text", "image"]` when the
+engine's vision encoder is ready, and `["text"]` otherwise. This reflects the
+loaded runtime capability, including `--vision FILE`, rather than the model
+name. All aliases share that capability, so clients can discover image support
+without a manual vision override or an inference request.
 
 ```sh
 curl http://127.0.0.1:8000/v1/chat/completions \
@@ -96,10 +103,23 @@ For the eight-L40S example, see [CUDA GPUs](CUDA_MULTI_GPU.md#serve-multiple-use
 Start with the matching language GGUF and `--vision FILE`; see
 [model-specific instructions](MODELS.md#vision).
 
-OpenAI chat and Responses accept inline PNG/JPEG data URIs. Anthropic accepts
-base64 image sources. Remote URLs and server-side file paths are rejected.
+OpenAI chat and Responses accept inline PNG/JPEG/WebP data URIs. Anthropic accepts
+base64 image sources with the same media types. WebP supports both lossy and
+lossless still images; animated WebP is rejected explicitly. WebP decoding
+uses `libwebp` (see the README build prerequisites). Remote URLs and server-side
+file paths remain rejected.
+Unsupported image formats and malformed base64 produce image-specific errors,
+not a misleading JSON syntax error. Decoded WebP dimensions and pixel count are
+checked before allocation against the existing image limits.
 Image blocks preserve their order in the request. The limit is 16 images and
 a 64 MiB HTTP body.
+
+Inference-free regression checks: `make tests/test_image_decode ds4_test`, then
+`./tests/test_image_decode` and `./ds4_test --server`. The checked-in WebP fixture
+is synthetic and self-contained. These tests need no client harness, model
+weights, running inference service, or network access.
+Regenerate `tests/vision-fixtures/webp.h` with the Python/Pillow command in
+`tests/vision-fixtures/generate_webp.py`, then rerun both tests.
 
 ## Disk KV cache
 

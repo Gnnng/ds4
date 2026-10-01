@@ -447,6 +447,7 @@ typedef struct {
     server_image_input *v;
     size_t len;
     size_t cap;
+    const char *error; /* Static diagnostic, retained until parser cleanup. */
 } server_image_inputs;
 
 static void server_image_inputs_free(server_image_inputs *images) {
@@ -499,17 +500,23 @@ static bool server_image_media_type(const char *media_type) {
     return media_type &&
            (!strcasecmp(media_type, "image/png") ||
             !strcasecmp(media_type, "image/jpeg") ||
-            !strcasecmp(media_type, "image/jpg"));
+            !strcasecmp(media_type, "image/jpg") ||
+            !strcasecmp(media_type, "image/webp"));
 }
 
 static bool server_image_inputs_push_base64(server_image_inputs *images,
                                             const char *media_type,
                                             const char *base64,
                                             char marker[SERVER_IMAGE_MARKER_BYTES]) {
-    if (!server_image_media_type(media_type)) return false;
-    server_image_input image = {0};
-    if (!server_decode_base64(base64, &image.encoded, &image.encoded_len))
+    if (!server_image_media_type(media_type)) {
+        images->error = "unsupported image media type; use image/png, image/jpeg, or image/webp";
         return false;
+    }
+    server_image_input image = {0};
+    if (!server_decode_base64(base64, &image.encoded, &image.encoded_len)) {
+        images->error = "invalid image base64 data (empty, malformed, or too large)";
+        return false;
+    }
     unsigned char nonce[12];
     if (!random_bytes(nonce, sizeof(nonce))) {
         uint64_t fallback = (uint64_t)time(NULL) ^
@@ -543,7 +550,11 @@ static bool server_image_inputs_push_data_uri(
     static const char png[] = "data:image/png;base64,";
     static const char jpeg[] = "data:image/jpeg;base64,";
     static const char jpg[] = "data:image/jpg;base64,";
-    if (!uri) return false;
+    static const char webp[] = "data:image/webp;base64,";
+    if (!uri) {
+        images->error = "missing image URL; use an inline base64 PNG, JPEG, or WebP data URI";
+        return false;
+    }
     if (!strncmp(uri, png, sizeof(png) - 1))
         return server_image_inputs_push_base64(
             images, "image/png", uri + sizeof(png) - 1, marker);
@@ -553,6 +564,10 @@ static bool server_image_inputs_push_data_uri(
     if (!strncmp(uri, jpg, sizeof(jpg) - 1))
         return server_image_inputs_push_base64(
             images, "image/jpg", uri + sizeof(jpg) - 1, marker);
+    if (!strncmp(uri, webp, sizeof(webp) - 1))
+        return server_image_inputs_push_base64(
+            images, "image/webp", uri + sizeof(webp) - 1, marker);
+    images->error = "unsupported image URL or format; use an inline base64 PNG, JPEG, or WebP data URI (remote URLs and file paths are not supported)";
     return false;
 }
 
@@ -773,6 +788,7 @@ typedef struct {
     chat_msg *v;
     int len;
     int cap;
+    const char *parse_error; /* Image diagnostics are not JSON syntax failures. */
 } chat_msgs;
 
 static void tool_memory_attach_to_messages(server *s, chat_msgs *msgs,
@@ -2138,6 +2154,7 @@ static bool parse_messages(const char **p, chat_msgs *msgs) {
         json_ws(p);
         continue;
 fail:
+        msgs->parse_error = msg.images.error;
         chat_msg_free(&msg);
         return false;
     }
@@ -2291,6 +2308,7 @@ static bool parse_anthropic_content_block(const char **p, bool allow_tools, chat
         chat_msg nested = {0};
         const char *content = tool_result ? tool_result : "\"\"";
         if (!parse_anthropic_content(&content, &nested, false)) {
+            msg->images.error = nested.images.error;
             chat_msg_free(&nested);
             goto bad;
         }
@@ -2322,8 +2340,11 @@ static bool parse_anthropic_content_block(const char **p, bool allow_tools, chat
         chat_msg_free(&nested);
     } else if (type && !strcmp(type, "image")) {
         char marker[SERVER_IMAGE_MARKER_BYTES];
-        if (!source_type || strcmp(source_type, "base64") ||
-            !server_image_inputs_push_base64(&msg->images, media_type,
+        if (!source_type || strcmp(source_type, "base64")) {
+            msg->images.error = "unsupported image source; use base64 PNG, JPEG, or WebP";
+            goto bad;
+        }
+        if (!server_image_inputs_push_base64(&msg->images, media_type,
                                              image_data, marker))
             goto bad;
         append_owned_text(&msg->content, marker);
@@ -2461,6 +2482,7 @@ static bool parse_anthropic_messages(const char **p, chat_msgs *msgs) {
         json_ws(p);
         continue;
 fail:
+        msgs->parse_error = msg.images.error;
         chat_msg_free(&msg);
         return false;
     }
@@ -4286,9 +4308,9 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     free(tool_schemas);
     return true;
 bad:
+    snprintf(err, errlen, "%s", msgs.parse_error ? msgs.parse_error : "invalid JSON request");
     chat_msgs_free(&msgs);
     free(tool_schemas);
-    snprintf(err, errlen, "invalid JSON request");
     request_free(r);
     return false;
 }
@@ -4515,10 +4537,10 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     free(tool_schemas);
     return true;
 bad:
+    snprintf(err, errlen, "%s", msgs.parse_error ? msgs.parse_error : "invalid JSON request");
     chat_msgs_free(&msgs);
     free(system);
     free(tool_schemas);
-    snprintf(err, errlen, "invalid JSON request");
     request_free(r);
     return false;
 }
@@ -4686,7 +4708,9 @@ static bool parse_responses_content_array_multimodal(
     char *tmp = NULL;
     server_image_inputs_free(images);
     if (!parse_responses_content_array(p, &tmp, images)) {
+        const char *error = images->error;
         server_image_inputs_free(images);
+        images->error = error;
         return false;
     }
     free(*dst);
@@ -4870,6 +4894,7 @@ static bool parse_responses_input(const char **p, chat_msgs *msgs,
             json_ws(p);
             continue;
 item_fail:
+            msgs->parse_error = content_images.error ? content_images.error : output_images.error;
             free(type);
             free(role);
             free(content);
@@ -5549,11 +5574,11 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     free(tool_schemas);
     return true;
 bad:
+    snprintf(err, errlen, "%s", msgs.parse_error ? msgs.parse_error : "invalid JSON request");
     chat_msgs_free(&msgs);
     buf_free(&loaded_tool_schemas);
     free(instructions);
     free(tool_schemas);
-    snprintf(err, errlen, "invalid JSON request");
     request_free(r);
     return false;
 }
@@ -15079,7 +15104,7 @@ typedef struct {
 } client_arg;
 
 static void append_model_json_values(buf *b, const char *id, const char *name,
-                                     int ctx, int default_tokens) {
+                                     int ctx, int default_tokens, bool vision) {
     const int max_completion = default_tokens < ctx ? default_tokens : ctx;
     buf_printf(b,
         "{\"id\":");
@@ -15090,6 +15115,8 @@ static void append_model_json_values(buf *b, const char *id, const char *name,
         "\"owned_by\":\"ds4.c\","
         "\"name\":");
     json_escape(b, name);
+    buf_puts(b, vision ? ",\"input_modalities\":[\"text\",\"image\"]"
+                       : ",\"input_modalities\":[\"text\"]");
     buf_printf(b,
         ","
         "\"context_length\":%d,"
@@ -15120,7 +15147,8 @@ static void append_model_json(buf *b, const server *s, const char *id) {
                              id,
                              ds4_engine_model_name(s->engine),
                              s->ctx_size,
-                             s->default_tokens);
+                             s->default_tokens,
+                             ds4_engine_has_vision(s->engine));
 }
 
 static bool send_model(server *s, int fd, const char *id) {
@@ -16125,6 +16153,9 @@ int main(int argc, char **argv) {
     return 0;
 }
 #else
+
+#include "ds4_image.h"
+#include "tests/vision-fixtures/webp.h"
 
 static int test_failures = 0;
 
@@ -21097,7 +21128,7 @@ static void test_tool_history_validation_handles_large_replays(void) {
 static void test_model_metadata_clamps_completion_to_context(void) {
     buf b = {0};
     append_model_json_values(&b, "deepseek-v4-flash", "DeepSeek V4 Flash",
-                             32768, 393216);
+                             32768, 393216, false);
     TEST_ASSERT(strstr(b.ptr, "\"id\":\"deepseek-v4-flash\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"name\":\"DeepSeek V4 Flash\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"context_length\":32768") != NULL);
@@ -21106,12 +21137,34 @@ static void test_model_metadata_clamps_completion_to_context(void) {
     buf_free(&b);
 
     append_model_json_values(&b, "deepseek-v4-pro", "DeepSeek V4 Pro",
-                             100000, 4096);
+                             100000, 4096, false);
     TEST_ASSERT(strstr(b.ptr, "\"id\":\"deepseek-v4-pro\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"name\":\"DeepSeek V4 Pro\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"context_length\":100000") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"max_completion_tokens\":4096") != NULL);
     buf_free(&b);
+}
+
+static void test_model_metadata_reports_input_modalities(void) {
+    const char *ids[] = {
+        "qwen3.8-flash-next", "qwen3.8-flash-next-chat",
+        "qwen3.8-flash-next-reasoner", "arbitrary-model"
+    };
+    for (int vision = 0; vision <= 1; vision++) {
+        for (size_t i = 0; i < sizeof(ids) / sizeof(ids[0]); i++) {
+            buf b = {0};
+            append_model_json_values(&b, ids[i], "Fixture model",
+                                     131072, 32768, vision != 0);
+            TEST_ASSERT(strstr(b.ptr, vision
+                ? "\"input_modalities\":[\"text\",\"image\"]"
+                : "\"input_modalities\":[\"text\"]") != NULL);
+            TEST_ASSERT((strstr(b.ptr, "\"image\"") != NULL) == (vision != 0));
+            const char *json = b.ptr;
+            TEST_ASSERT(json_skip_value(&json));
+            TEST_ASSERT(*json == '\0');
+            buf_free(&b);
+        }
+    }
 }
 
 static void test_live_prefix_rewind_target(void) {
@@ -22520,6 +22573,68 @@ static void test_thinking_canonical_non_thinking_mode_noop(void) {
     chat_msgs_free(&msgs);
 }
 
+static void test_inline_webp_content(void) {
+    const char *formats[] = {
+        "[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/webp;base64,%s\"}}]}]",
+        "[{\"role\":\"user\",\"content\":[{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/webp\",\"data\":\"%s\"}}]}]",
+        "[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_image\",\"image_url\":\"data:image/webp;base64,%s\"}]}]",
+    };
+    for (int api = 0; api < 3; api++) {
+        buf json = {0};
+        buf_printf(&json, formats[api], DS4_TEST_WEBP_BASE64);
+        const char *p = json.ptr;
+        chat_msgs msgs = {0};
+        bool ok = api == 0 ? parse_messages(&p, &msgs) : api == 1 ?
+                  parse_anthropic_messages(&p, &msgs) : parse_responses_input(&p, &msgs, NULL, NULL);
+        TEST_ASSERT(ok && msgs.len == 1 && msgs.v[0].images.len == 1);
+        if (ok && msgs.len == 1 && msgs.v[0].images.len == 1) {
+            server_image_input *input = &msgs.v[0].images.v[0];
+            TEST_ASSERT(input->encoded_len == sizeof(ds4_test_webp) &&
+                        !memcmp(input->encoded, ds4_test_webp, sizeof(ds4_test_webp)));
+            ds4_image image = {0};
+            char error[160] = {0};
+            TEST_ASSERT(ds4_image_decode_memory(&image, input->encoded, input->encoded_len,
+                                                error, sizeof(error)));
+            TEST_ASSERT(image.width == 8 && image.height == 8);
+            ds4_image_free(&image);
+        }
+        chat_msgs_free(&msgs);
+        buf_free(&json);
+    }
+
+    /* Synthetic OpenAI request: parsing reaches the engine gate,
+     * instead of rejecting valid WebP as invalid JSON. No model is loaded. */
+    request r;
+    char error[200] = {0};
+    TEST_ASSERT(!parse_chat_request(NULL, NULL, DS4_TEST_WEBP_REQUEST,
+                                   32, 131072, &r, error, sizeof(error)));
+    TEST_ASSERT(strstr(error, "requires starting ds4-server with --vision") != NULL);
+}
+
+static void test_image_request_errors(void) {
+    const char *formats[] = {
+        "{\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:%s;base64,%s\"}}]}]}",
+        "{\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"%s\",\"data\":\"%s\"}}]}]}",
+        "{\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_image\",\"image_url\":\"data:%s;base64,%s\"}]}]}",
+    };
+    for (int api = 0; api < 3; api++) {
+        for (int malformed = 0; malformed < 2; malformed++) {
+            buf json = {0};
+            buf_printf(&json, formats[api], malformed ? "image/webp" : "image/gif",
+                       malformed ? "bad!" : "AAAA");
+            request r;
+            char error[200] = {0};
+            bool ok = api == 0 ? parse_chat_request(NULL, NULL, json.ptr, 32, 131072, &r, error, sizeof(error)) :
+                      api == 1 ? parse_anthropic_request(NULL, NULL, json.ptr, 32, 131072, &r, error, sizeof(error)) :
+                      parse_responses_request(NULL, NULL, json.ptr, 32, 131072, &r, error, sizeof(error));
+            TEST_ASSERT(!ok);
+            TEST_ASSERT(strstr(error, malformed ? "invalid image base64" : "unsupported image") != NULL);
+            if (ok) request_free(&r);
+            buf_free(&json);
+        }
+    }
+}
+
 static const char test_inline_png_base64[] =
     "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAFUlEQVR4nGP8z8DQwMDAwMAEIkAYABglAYOd/VRoAAAAAElFTkSuQmCC";
 
@@ -22926,6 +23041,8 @@ static void ds4_server_unit_tests_run(void) {
     test_anthropic_tool_image_output();
     test_responses_tool_image_output();
     test_server_image_embedding_cache();
+    test_inline_webp_content();
+    test_image_request_errors();
     test_batched_prefill_round_robin();
     test_mixed_prefill_quantum_option();
     test_multimodal_prefill_resume_frontier();
@@ -23055,6 +23172,7 @@ static void ds4_server_unit_tests_run(void) {
     test_json_int_handles_non_finite_values();
     test_tool_history_validation_handles_large_replays();
     test_model_metadata_clamps_completion_to_context();
+    test_model_metadata_reports_input_modalities();
     test_live_prefix_rewind_target();
     test_client_socket_nonblocking_flag();
     test_client_disconnect_probe();

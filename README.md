@@ -90,6 +90,12 @@ cd ds4
 Choose your build. The platform guides cover prerequisites, memory sizing,
 and hardware-specific setups:
 
+The image decoder also needs `libwebp` development files and `pkg-config`:
+`brew install webp pkg-config` on macOS, or
+`sudo apt-get install libwebp-dev pkg-config` on Debian/Ubuntu. The Makefile
+discovers them through `pkg-config`; custom builds may set `WEBP_CFLAGS` and
+`WEBP_LIBS` explicitly.
+
 | Platform guide | Build |
 | --- | --- |
 | [Metal on Apple Silicon](docs/METAL.md) | `make` |

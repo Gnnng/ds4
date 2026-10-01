@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <webp/decode.h>
 
 #define JPEG_IMPLEMENTATION
 #define PNG_IMPLEMENTATION
@@ -275,7 +276,39 @@ int ds4_image_decode_memory(
         return ok;
     }
 
-    ds4_image_error(error, error_cap, "image must be JPEG or PNG");
+    if (encoded_len >= 12 && !memcmp(encoded, "RIFF", 4) &&
+        !memcmp(encoded + 8, "WEBP", 4)) {
+        WebPBitstreamFeatures features;
+        if (WebPGetFeatures(encoded, encoded_len, &features) != VP8_STATUS_OK) {
+            ds4_image_error(error, error_cap, "invalid or truncated WebP image");
+            return 0;
+        }
+        if (features.has_animation) {
+            ds4_image_error(error, error_cap, "animated WebP is unsupported; send a still image");
+            return 0;
+        }
+        if (features.width <= 0 || features.height <= 0 ||
+            (uint32_t)features.width > DS4_IMAGE_MAX_DIMENSION ||
+            (uint32_t)features.height > DS4_IMAGE_MAX_DIMENSION ||
+            (uint64_t)features.width * (uint64_t)features.height > DS4_IMAGE_MAX_PIXELS) {
+            ds4_image_error(error, error_cap, "WebP image exceeds the decoded pixel limit");
+            return 0;
+        }
+        int width = 0, height = 0;
+        uint8_t *rgba = WebPDecodeRGBA(encoded, encoded_len, &width, &height);
+        if (!rgba) {
+            ds4_image_error(error, error_cap, "invalid or truncated WebP image");
+            return 0;
+        }
+        /* Match PNG/JPEG's RGB conversion and content fingerprinting. */
+        int ok = ds4_oriented_rgb(out, rgba, (uint32_t)width,
+                                  (uint32_t)height, 4, 1);
+        WebPFree(rgba);
+        if (!ok) ds4_image_error(error, error_cap, "unable to allocate decoded WebP pixels");
+        return ok;
+    }
+
+    ds4_image_error(error, error_cap, "image must be JPEG, PNG, or WebP");
     return 0;
 }
 

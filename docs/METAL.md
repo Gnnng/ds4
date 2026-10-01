@@ -10,6 +10,12 @@ Install Apple's command-line developer tools if needed:
 xcode-select --install
 ```
 
+Install the WebP decoder build dependency (if not already present):
+
+```sh
+brew install webp pkg-config
+```
+
 From the repository root:
 
 ```sh
